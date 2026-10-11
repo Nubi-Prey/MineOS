@@ -1,0 +1,658 @@
+diff -uNr -x build -x '.*' orig/cage-0.2.0/cage.c cage-0.2.0/cage.c
+--- a/cage.c	2024-10-06 10:24:22.000000000 -0300
++++ b/cage.c	2026-10-11 19:13:51.121936916 -0300
+@@ -528,6 +528,15 @@
+ 		goto end;
+ 	}
+ 
++	server.pointer_constraints = wlr_pointer_constraints_v1_create(server.wl_display);
++	if (!server.pointer_constraints) {
++		wlr_log(WLR_ERROR, "Unable to create the pointer constraints manager");
++		ret = 1;
++		goto end;
++	}
++	server.new_constraint.notify = handle_pointer_constraint;
++	wl_signal_add(&server.pointer_constraints->events.new_constraint, &server.new_constraint);
++
+ #if CAGE_HAS_XWAYLAND
+ 	struct wlr_xcursor_manager *xcursor_manager = NULL;
+ 	struct wlr_xwayland *xwayland = wlr_xwayland_create(server.wl_display, compositor, true);
+diff -uNr -x build -x '.*' orig/cage-0.2.0/meson.build cage-0.2.0/meson.build
+--- a/meson.build	2024-10-06 10:24:22.000000000 -0300
++++ b/meson.build	2026-10-11 19:13:27.848077327 -0300
+@@ -39,6 +39,7 @@
+ wayland_protos = dependency('wayland-protocols', version: '>=1.14')
+ wayland_server = dependency('wayland-server')
+ xkbcommon      = dependency('xkbcommon')
++pixman         = dependency('pixman-1')
+ math           = cc.find_library('m')
+ 
+ wl_protocol_dir = wayland_protos.get_variable('pkgdatadir')
+@@ -51,6 +52,7 @@
+ 
+ server_protocols = [
+   [wl_protocol_dir, 'stable/xdg-shell/xdg-shell.xml'],
++  [wl_protocol_dir, 'unstable/pointer-constraints/pointer-constraints-unstable-v1.xml'],
+ ]
+ 
+ server_protos_headers = []
+@@ -144,6 +146,7 @@
+     wayland_server,
+     wlroots,
+     xkbcommon,
++    pixman,
+     math,
+   ],
+   install: true,
+diff -uNr -x build -x '.*' orig/cage-0.2.0/seat.c cage-0.2.0/seat.c
+--- a/seat.c	2024-10-06 10:24:22.000000000 -0300
++++ b/seat.c	2026-10-11 19:39:39.822287498 -0300
+@@ -12,8 +12,11 @@
+ 
+ #include <assert.h>
+ #include <linux/input-event-codes.h>
++#include <math.h>
++#include <pixman.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <time.h>
+ #include <wayland-server-core.h>
+ #include <wlr/backend.h>
+ #include <wlr/backend/multi.h>
+@@ -22,9 +25,11 @@
+ #include <wlr/types/wlr_data_device.h>
+ #include <wlr/types/wlr_idle_notify_v1.h>
+ #include <wlr/types/wlr_keyboard_group.h>
++#include <wlr/types/wlr_pointer_constraints_v1.h>
+ #include <wlr/types/wlr_primary_selection.h>
+ #include <wlr/types/wlr_relative_pointer_v1.h>
+ #include <wlr/types/wlr_scene.h>
++#include <wlr/util/region.h>
+ #include <wlr/types/wlr_seat.h>
+ #include <wlr/types/wlr_touch.h>
+ #include <wlr/types/wlr_virtual_keyboard_v1.h>
+@@ -223,6 +228,18 @@
+ 	map_input_device_to_output(seat, &wlr_pointer->base, wlr_pointer->output_name);
+ }
+ 
++static struct cg_pointer *
++pointer_from_wlr_pointer(struct cg_seat *seat, struct wlr_pointer *wlr_pointer)
++{
++	struct cg_pointer *pointer;
++	wl_list_for_each (pointer, &seat->pointers, link) {
++		if (pointer->pointer == wlr_pointer) {
++			return pointer;
++		}
++	}
++	return NULL;
++}
++
+ static void
+ handle_virtual_pointer(struct wl_listener *listener, void *data)
+ {
+@@ -607,28 +624,392 @@
+ 	wlr_idle_notifier_v1_notify_activity(seat->server->idle, seat->seat);
+ }
+ 
++static struct wlr_scene_node *
++scene_node_for_surface(struct wlr_scene_node *node, struct wlr_surface *surface)
++{
++	switch (node->type) {
++	case WLR_SCENE_NODE_BUFFER: {
++		struct wlr_scene_buffer *scene_buffer = wlr_scene_buffer_from_node(node);
++		struct wlr_scene_surface *scene_surface = wlr_scene_surface_try_from_buffer(scene_buffer);
++		return scene_surface && scene_surface->surface == surface ? node : NULL;
++	}
++	case WLR_SCENE_NODE_TREE: {
++		struct wlr_scene_tree *tree = wl_container_of(node, tree, node);
++		struct wlr_scene_node *child;
++		wl_list_for_each (child, &tree->children, link) {
++			struct wlr_scene_node *found = scene_node_for_surface(child, surface);
++			if (found) {
++				return found;
++			}
++		}
++		return NULL;
++	}
++	default:
++		return NULL;
++	}
++}
++
++static bool
++constraint_cursor_position(struct cg_seat *seat, struct wlr_pointer_constraint_v1 *constraint, double *sx, double *sy)
++{
++	struct wlr_scene_node *node = scene_node_for_surface(&seat->server->scene->tree.node, constraint->surface);
++	int lx, ly;
++	if (!node || !wlr_scene_node_coords(node, &lx, &ly)) {
++		return false;
++	}
++	*sx = seat->cursor->x - lx;
++	*sy = seat->cursor->y - ly;
++	return true;
++}
++
+ static void
+-process_cursor_motion(struct cg_seat *seat, uint32_t time_msec, double dx, double dy, double dx_unaccel,
+-		      double dy_unaccel)
++warp_to_constraint_cursor_hint(struct cg_seat *seat)
++{
++	struct wlr_pointer_constraint_v1 *constraint = seat->active_constraint;
++	if (!seat->constraint_enforced || !(constraint->current.committed & WLR_POINTER_CONSTRAINT_V1_STATE_CURSOR_HINT)) {
++		return;
++	}
++
++	double cursor_sx, cursor_sy;
++	if (!constraint_cursor_position(seat, constraint, &cursor_sx, &cursor_sy)) {
++		return;
++	}
++	double sx = constraint->current.cursor_hint.x;
++	double sy = constraint->current.cursor_hint.y;
++	if (!wlr_cursor_warp(seat->cursor, NULL, seat->cursor->x + sx - cursor_sx, seat->cursor->y + sy - cursor_sy)) {
++		return;
++	}
++	if (seat->seat->pointer_state.focused_surface == constraint->surface) {
++		wlr_seat_pointer_warp(seat->seat, sx, sy);
++	}
++}
++
++static void
++constraint_effective_region(struct wlr_pointer_constraint_v1 *constraint, pixman_region32_t *region)
++{
++	if (pixman_region32_not_empty(&constraint->current.region)) {
++		pixman_region32_intersect(region, &constraint->surface->input_region, &constraint->current.region);
++	} else {
++		pixman_region32_copy(region, &constraint->surface->input_region);
++	}
++}
++
++static bool
++region_nearest_point(pixman_region32_t *region, double sx, double sy, double *nx, double *ny)
++{
++	int nboxes;
++	pixman_box32_t *boxes = pixman_region32_rectangles(region, &nboxes);
++	double best = INFINITY;
++	for (int i = 0; i < nboxes; i++) {
++		double x = fmax(boxes[i].x1 + 0.5, fmin(sx, boxes[i].x2 - 0.5));
++		double y = fmax(boxes[i].y1 + 0.5, fmin(sy, boxes[i].y2 - 0.5));
++		double distance = (x - sx) * (x - sx) + (y - sy) * (y - sy);
++		if (distance < best) {
++			best = distance;
++			*nx = x;
++			*ny = y;
++		}
++	}
++	return nboxes > 0;
++}
++
++static bool
++constraint_warp_into_region(struct cg_seat *seat, pixman_region32_t *region, double *sx, double *sy)
++{
++	if (pixman_region32_contains_point(region, (int) floor(*sx), (int) floor(*sy), NULL)) {
++		return true;
++	}
++
++	double nx = 0, ny = 0;
++	if (!region_nearest_point(region, *sx, *sy, &nx, &ny)) {
++		return false;
++	}
++	if (!wlr_cursor_warp(seat->cursor, NULL, seat->cursor->x + nx - *sx, seat->cursor->y + ny - *sy)) {
++		return false;
++	}
++	*sx = nx;
++	*sy = ny;
++	return true;
++}
++
++static bool
++constraint_enforce_region(struct cg_seat *seat, bool send_motion, uint32_t time_msec)
+ {
++	struct wlr_pointer_constraint_v1 *constraint = seat->active_constraint;
++
+ 	double sx, sy;
+-	struct wlr_seat *wlr_seat = seat->seat;
+-	struct wlr_surface *surface = NULL;
++	if (!constraint_cursor_position(seat, constraint, &sx, &sy)) {
++		return false;
++	}
+ 
+-	struct cg_view *view = desktop_view_at(seat->server, seat->cursor->x, seat->cursor->y, &surface, &sx, &sy);
+-	if (!view) {
+-		wlr_seat_pointer_clear_focus(wlr_seat);
++	if (!constraint_warp_into_region(seat, &seat->constraint_region, &sx, &sy)) {
++		return false;
++	}
++
++	struct wlr_seat_pointer_state *pointer_state = &seat->seat->pointer_state;
++	if (pointer_state->focused_surface != constraint->surface ||
++	    (pointer_state->sx == sx && pointer_state->sy == sy)) {
++		return true;
++	}
++	if (send_motion) {
++		wlr_seat_pointer_notify_motion(seat->seat, time_msec, sx, sy);
+ 	} else {
+-		wlr_seat_pointer_notify_enter(wlr_seat, surface, sx, sy);
+-		wlr_seat_pointer_notify_motion(wlr_seat, time_msec, sx, sy);
++		wlr_seat_pointer_warp(seat->seat, sx, sy);
++	}
++	return true;
++}
++
++static void
++handle_constraint_sync_idle(void *data)
++{
++	struct cg_seat *seat = data;
++	seat->constraint_sync_idle = NULL;
++
++	if (!seat->active_constraint || seat->constraint_enforced == seat->constraint_notified) {
++		return;
++	}
++	seat->constraint_notified = seat->constraint_enforced;
++	if (seat->constraint_notified) {
++		wlr_pointer_constraint_v1_send_activated(seat->active_constraint);
++		if (seat->active_constraint->type == WLR_POINTER_CONSTRAINT_V1_LOCKED) {
++			wlr_cursor_unset_image(seat->cursor);
++		}
++	} else {
++		wlr_pointer_constraint_v1_send_deactivated(seat->active_constraint);
++		wlr_cursor_set_xcursor(seat->cursor, seat->xcursor_manager, DEFAULT_XCURSOR);
++	}
++}
++
++static void
++constraint_sync_client(struct cg_seat *seat)
++{
++	if (seat->constraint_sync_idle || seat->constraint_enforced == seat->constraint_notified) {
++		return;
++	}
++	struct wl_event_loop *loop = wl_display_get_event_loop(seat->server->wl_display);
++	seat->constraint_sync_idle = wl_event_loop_add_idle(loop, handle_constraint_sync_idle, seat);
++	if (!seat->constraint_sync_idle) {
++		wlr_log(WLR_ERROR, "Cannot notify a client of its pointer constraint's state");
++	}
++}
++
++static void
++constraint_detach(struct cg_seat *seat)
++{
++	seat->active_constraint = NULL;
++	seat->constraint_enforced = false;
++	seat->constraint_notified = false;
++	pixman_region32_clear(&seat->constraint_region);
++	if (seat->constraint_sync_idle) {
++		wl_event_source_remove(seat->constraint_sync_idle);
++		seat->constraint_sync_idle = NULL;
++	}
++	wl_list_remove(&seat->constraint_set_region.link);
++	wl_list_init(&seat->constraint_set_region.link);
++	wl_list_remove(&seat->constraint_destroy.link);
++	wl_list_init(&seat->constraint_destroy.link);
++	wlr_cursor_set_xcursor(seat->cursor, seat->xcursor_manager, DEFAULT_XCURSOR);
++}
++
++static void
++constraint_update(struct cg_seat *seat, bool send_motion, uint32_t time_msec)
++{
++	struct wlr_pointer_constraint_v1 *constraint = seat->active_constraint;
++	if (!constraint) {
++		return;
+ 	}
+ 
++	if (seat->constraint_enforced && constraint->type == WLR_POINTER_CONSTRAINT_V1_LOCKED) {
++		return;
++	}
++
++	send_motion = send_motion && seat->constraint_enforced;
++	seat->constraint_enforced = constraint_enforce_region(seat, send_motion, time_msec);
++	constraint_sync_client(seat);
++}
++
++static uint32_t
++now_msec(void)
++{
++	struct timespec now = {0};
++	clock_gettime(CLOCK_MONOTONIC, &now);
++	return (uint32_t) (now.tv_sec * 1000 + now.tv_nsec / 1000000);
++}
++
++static void
++handle_constraint_set_region(struct wl_listener *listener, void *data)
++{
++	struct cg_seat *seat = wl_container_of(listener, seat, constraint_set_region);
++
++	constraint_effective_region(seat->active_constraint, &seat->constraint_region);
++	constraint_update(seat, true, now_msec());
++}
++
++static void
++handle_constraint_destroy(struct wl_listener *listener, void *data)
++{
++	struct cg_seat *seat = wl_container_of(listener, seat, constraint_destroy);
++
++	warp_to_constraint_cursor_hint(seat);
++	constraint_detach(seat);
++}
++
++static void
++constraint_set_active(struct cg_seat *seat, struct wlr_pointer_constraint_v1 *constraint)
++{
++	if (seat->active_constraint == constraint) {
++		return;
++	}
++
++	if (seat->active_constraint) {
++		struct wlr_pointer_constraint_v1 *prev = seat->active_constraint;
++		bool notified = seat->constraint_notified;
++		warp_to_constraint_cursor_hint(seat);
++		constraint_detach(seat);
++		if (notified) {
++			wlr_pointer_constraint_v1_send_deactivated(prev);
++		}
++	}
++
++	if (!constraint) {
++		return;
++	}
++
++	seat->active_constraint = constraint;
++	seat->constraint_set_region.notify = handle_constraint_set_region;
++	wl_signal_add(&constraint->events.set_region, &seat->constraint_set_region);
++	seat->constraint_destroy.notify = handle_constraint_destroy;
++	wl_signal_add(&constraint->events.destroy, &seat->constraint_destroy);
++
++	constraint_effective_region(constraint, &seat->constraint_region);
++	constraint_update(seat, false, 0);
++}
++
++void
++handle_pointer_constraint(struct wl_listener *listener, void *data)
++{
++	struct cg_server *server = wl_container_of(listener, server, new_constraint);
++	struct wlr_pointer_constraint_v1 *constraint = data;
++	struct cg_seat *seat = server->seat;
++
++	if (seat->seat->pointer_state.focused_surface == constraint->surface) {
++		constraint_set_active(seat, constraint);
++	}
++}
++
++static void
++handle_pointer_focus_change(struct wl_listener *listener, void *data)
++{
++	struct cg_seat *seat = wl_container_of(listener, seat, pointer_focus_change);
++	struct wlr_seat_pointer_focus_change_event *event = data;
++
++	struct wlr_pointer_constraint_v1 *constraint = NULL;
++	if (event->new_surface) {
++		constraint = wlr_pointer_constraints_v1_constraint_for_surface(seat->server->pointer_constraints,
++									       event->new_surface, seat->seat);
++	}
++	constraint_set_active(seat, constraint);
++}
++
++static bool
++constraint_locks_cursor(struct cg_seat *seat)
++{
++	return seat->constraint_enforced && seat->active_constraint->type == WLR_POINTER_CONSTRAINT_V1_LOCKED;
++}
++
++static void
++constrain_delta(struct cg_seat *seat, double *dx, double *dy)
++{
++	if (!seat->constraint_enforced) {
++		return;
++	}
++	if (constraint_locks_cursor(seat)) {
++		*dx = *dy = 0;
++		return;
++	}
++
++	struct wlr_seat_pointer_state *pointer_state = &seat->seat->pointer_state;
++	double sx = pointer_state->sx;
++	double sy = pointer_state->sy;
++	double sx_confined, sy_confined;
++	if (wlr_region_confine(&seat->constraint_region, sx, sy, sx + *dx, sy + *dy, &sx_confined, &sy_confined)) {
++		*dx = sx_confined - sx;
++		*dy = sy_confined - sy;
++		return;
++	}
++
++	double nx = 0, ny = 0;
++	if (region_nearest_point(&seat->constraint_region, sx, sy, &nx, &ny)) {
++		*dx = nx - sx;
++		*dy = ny - sy;
++	} else {
++		*dx = *dy = 0;
++	}
++}
++
++static void
++process_cursor_motion(struct cg_seat *seat, uint32_t time_msec, double dx, double dy, double dx_unaccel,
++		      double dy_unaccel, bool scene_changed)
++{
++	struct wlr_seat *wlr_seat = seat->seat;
++
+ 	if (dx != 0 || dy != 0) {
+ 		wlr_relative_pointer_manager_v1_send_relative_motion(seat->server->relative_pointer_manager, wlr_seat,
+ 								     (uint64_t) time_msec * 1000, dx, dy, dx_unaccel,
+ 								     dy_unaccel);
+ 	}
+ 
++	if (!scene_changed && constraint_locks_cursor(seat)) {
++		wlr_idle_notifier_v1_notify_activity(seat->server->idle, seat->seat);
++		return;
++	}
++
++	double sx, sy;
++	struct wlr_surface *surface = NULL;
++	struct cg_view *view = desktop_view_at(seat->server, seat->cursor->x, seat->cursor->y, &surface, &sx, &sy);
++
++	if (view && surface != wlr_seat->pointer_state.focused_surface) {
++		struct wlr_pointer_constraint_v1 *next = wlr_pointer_constraints_v1_constraint_for_surface(
++			seat->server->pointer_constraints, surface, wlr_seat);
++		if (next) {
++			pixman_region32_t region;
++			pixman_region32_init(&region);
++			constraint_effective_region(next, &region);
++			double cursor_x = seat->cursor->x;
++			double cursor_y = seat->cursor->y;
++			constraint_warp_into_region(seat, &region, &sx, &sy);
++			pixman_region32_fini(&region);
++			if (seat->cursor->x != cursor_x || seat->cursor->y != cursor_y) {
++				view = desktop_view_at(seat->server, seat->cursor->x, seat->cursor->y, &surface, &sx,
++						       &sy);
++			}
++		}
++	}
++
++	if (!view) {
++		wlr_seat_pointer_clear_focus(wlr_seat);
++	} else if (surface != wlr_seat->pointer_state.focused_surface) {
++		double pre_enter_x = seat->cursor->x;
++		double pre_enter_y = seat->cursor->y;
++		wlr_seat_pointer_notify_enter(wlr_seat, surface, sx, sy);
++		if (seat->cursor->x != pre_enter_x || seat->cursor->y != pre_enter_y) {
++			view = desktop_view_at(seat->server, seat->cursor->x, seat->cursor->y, &surface, &sx, &sy);
++			if (!view) {
++				wlr_seat_pointer_clear_focus(wlr_seat);
++			} else if (surface != wlr_seat->pointer_state.focused_surface) {
++				wlr_seat_pointer_notify_enter(wlr_seat, surface, sx, sy);
++			}
++		}
++	}
++
++	if (view) {
++		if (constraint_locks_cursor(seat)) {
++			wlr_seat_pointer_warp(wlr_seat, sx, sy);
++		} else {
++			wlr_seat_pointer_notify_motion(wlr_seat, time_msec, sx, sy);
++		}
++	}
++
+ 	struct cg_drag_icon *drag_icon;
+ 	wl_list_for_each (drag_icon, &seat->drag_icons, link) {
+ 		drag_icon_update_position(drag_icon);
+@@ -646,11 +1027,36 @@
+ 	double lx, ly;
+ 	wlr_cursor_absolute_to_layout_coords(seat->cursor, &event->pointer->base, event->x, event->y, &lx, &ly);
+ 
+-	double dx = lx - seat->cursor->x;
+-	double dy = ly - seat->cursor->y;
++	struct cg_pointer *pointer = pointer_from_wlr_pointer(seat, event->pointer);
++	double dx, dy;
++	if (pointer && pointer->last_abs_valid) {
++		dx = lx - pointer->last_abs_x;
++		dy = ly - pointer->last_abs_y;
++	} else if (!seat->constraint_enforced) {
++		dx = lx - seat->cursor->x;
++		dy = ly - seat->cursor->y;
++	} else {
++		dx = dy = 0;
++	}
++	if (pointer) {
++		pointer->last_abs_x = lx;
++		pointer->last_abs_y = ly;
++		pointer->last_abs_valid = true;
++	}
++
++	if (seat->constraint_enforced) {
++		double move_x = lx - seat->cursor->x;
++		double move_y = ly - seat->cursor->y;
++		constrain_delta(seat, &move_x, &move_y);
++		if (move_x != 0 || move_y != 0) {
++			wlr_cursor_warp_closest(seat->cursor, &event->pointer->base, seat->cursor->x + move_x,
++						seat->cursor->y + move_y);
++		}
++	} else {
++		wlr_cursor_warp_absolute(seat->cursor, &event->pointer->base, event->x, event->y);
++	}
+ 
+-	wlr_cursor_warp_absolute(seat->cursor, &event->pointer->base, event->x, event->y);
+-	process_cursor_motion(seat, event->time_msec, dx, dy, dx, dy);
++	process_cursor_motion(seat, event->time_msec, dx, dy, dx, dy, false);
+ 	wlr_idle_notifier_v1_notify_activity(seat->server->idle, seat->seat);
+ }
+ 
+@@ -660,9 +1066,15 @@
+ 	struct cg_seat *seat = wl_container_of(listener, seat, cursor_motion_relative);
+ 	struct wlr_pointer_motion_event *event = data;
+ 
+-	wlr_cursor_move(seat->cursor, &event->pointer->base, event->delta_x, event->delta_y);
++	double dx = event->delta_x;
++	double dy = event->delta_y;
++	constrain_delta(seat, &dx, &dy);
++	if (dx != 0 || dy != 0) {
++		wlr_cursor_move(seat->cursor, &event->pointer->base, dx, dy);
++	}
++
+ 	process_cursor_motion(seat, event->time_msec, event->delta_x, event->delta_y, event->unaccel_dx,
+-			      event->unaccel_dy);
++			      event->unaccel_dy, false);
+ 	wlr_idle_notifier_v1_notify_activity(seat->server->idle, seat->seat);
+ }
+ 
+@@ -774,6 +1186,13 @@
+ 	wl_list_remove(&seat->request_set_cursor.link);
+ 	wl_list_remove(&seat->request_set_selection.link);
+ 	wl_list_remove(&seat->request_set_primary_selection.link);
++	wl_list_remove(&seat->pointer_focus_change.link);
++	wl_list_remove(&seat->constraint_set_region.link);
++	wl_list_remove(&seat->constraint_destroy.link);
++	if (seat->constraint_sync_idle) {
++		wl_event_source_remove(seat->constraint_sync_idle);
++	}
++	pixman_region32_fini(&seat->constraint_region);
+ 
+ 	struct cg_keyboard_group *group, *group_tmp;
+ 	wl_list_for_each_safe (group, group_tmp, &seat->keyboard_groups, link) {
+@@ -847,6 +1266,12 @@
+ 	seat->cursor_frame.notify = handle_cursor_frame;
+ 	wl_signal_add(&seat->cursor->events.frame, &seat->cursor_frame);
+ 
++	seat->pointer_focus_change.notify = handle_pointer_focus_change;
++	wl_signal_add(&seat->seat->pointer_state.events.focus_change, &seat->pointer_focus_change);
++	wl_list_init(&seat->constraint_set_region.link);
++	wl_list_init(&seat->constraint_destroy.link);
++	pixman_region32_init(&seat->constraint_region);
++
+ 	seat->touch_down.notify = handle_touch_down;
+ 	wl_signal_add(&seat->cursor->events.touch_down, &seat->touch_down);
+ 	seat->touch_up.notify = handle_touch_up;
+@@ -955,7 +1380,7 @@
+ 		wlr_seat_keyboard_notify_enter(wlr_seat, view->wlr_surface, NULL, 0, NULL);
+ 	}
+ 
+-	process_cursor_motion(seat, -1, 0, 0, 0, 0);
++	process_cursor_motion(seat, (uint32_t) -1, 0, 0, 0, 0, true);
+ }
+ 
+ void
+diff -uNr -x build -x '.*' orig/cage-0.2.0/seat.h cage-0.2.0/seat.h
+--- a/seat.h	2024-10-06 10:24:22.000000000 -0300
++++ b/seat.h	2026-10-11 19:14:25.977953248 -0300
+@@ -1,10 +1,12 @@
+ #ifndef CG_SEAT_H
+ #define CG_SEAT_H
+ 
++#include <pixman.h>
+ #include <wayland-server-core.h>
+ #include <wlr/types/wlr_cursor.h>
+ #include <wlr/types/wlr_data_device.h>
+ #include <wlr/types/wlr_input_device.h>
++#include <wlr/types/wlr_pointer_constraints_v1.h>
+ #include <wlr/types/wlr_seat.h>
+ #include <wlr/types/wlr_xcursor_manager.h>
+ 
+@@ -48,6 +50,15 @@
+ 	struct wl_listener request_set_cursor;
+ 	struct wl_listener request_set_selection;
+ 	struct wl_listener request_set_primary_selection;
++
++	struct wlr_pointer_constraint_v1 *active_constraint;
++	pixman_region32_t constraint_region;
++	bool constraint_enforced;
++	bool constraint_notified;
++	struct wl_event_source *constraint_sync_idle;
++	struct wl_listener constraint_set_region;
++	struct wl_listener constraint_destroy;
++	struct wl_listener pointer_focus_change;
+ };
+ 
+ struct cg_keyboard_group {
+@@ -64,6 +75,9 @@
+ 	struct cg_seat *seat;
+ 	struct wlr_pointer *pointer;
+ 
++	double last_abs_x, last_abs_y;
++	bool last_abs_valid;
++
+ 	struct wl_listener destroy;
+ };
+ 
+@@ -92,5 +106,6 @@
+ struct cg_view *seat_get_focus(struct cg_seat *seat);
+ void seat_set_focus(struct cg_seat *seat, struct cg_view *view);
+ void seat_center_cursor(struct cg_seat *seat);
++void handle_pointer_constraint(struct wl_listener *listener, void *data);
+ 
+ #endif
+diff -uNr -x build -x '.*' orig/cage-0.2.0/server.h cage-0.2.0/server.h
+--- a/server.h	2024-10-06 10:24:22.000000000 -0300
++++ b/server.h	2026-10-11 19:13:41.528994849 -0300
+@@ -7,6 +7,7 @@
+ #include <wlr/types/wlr_idle_inhibit_v1.h>
+ #include <wlr/types/wlr_idle_notify_v1.h>
+ #include <wlr/types/wlr_output_layout.h>
++#include <wlr/types/wlr_pointer_constraints_v1.h>
+ #include <wlr/types/wlr_relative_pointer_v1.h>
+ #include <wlr/types/wlr_xdg_decoration_v1.h>
+ #if CAGE_HAS_XWAYLAND
+@@ -58,6 +59,8 @@
+ 	struct wl_listener output_manager_test;
+ 
+ 	struct wlr_relative_pointer_manager_v1 *relative_pointer_manager;
++	struct wlr_pointer_constraints_v1 *pointer_constraints;
++	struct wl_listener new_constraint;
+ 
+ 	bool xdg_decoration;
+ 	bool allow_vt_switch;

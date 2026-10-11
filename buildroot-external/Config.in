@@ -1,0 +1,5 @@
+menu "MineOS Custom Configuration"
+
+# Opções e pacotes específicos do MineOS (Cage já é nativo no Buildroot)
+
+endmenu

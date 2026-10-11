@@ -1,0 +1,67 @@
+# ==============================================================================
+# MineOS - .gitignore
+# ==============================================================================
+
+# Buildroot - Árvore upstream e Diretórios de Compilação / Backup
+# (MineOS utiliza a arquitetura BR2_EXTERNAL; buildroot upstream é baixado sob demanda)
+buildroot/
+buildroot-2024.02-backup/
+buildroot*.tar.*
+!buildroot-external/
+
+# Rust / Cargo - Diretórios de Compilação
+target/
+**/target/
+Cargo.lock
+
+# Gradle / Java - Caches e Saídas de Build
+.gradle/
+**/.gradle/
+build/
+**/build/
+*.class
+*.jar
+!**/gradle-wrapper.jar
+*.hprof
+*.jfr
+*.tar.gz
+
+# Python e Framework de Testes
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Minecraft Runtime / Caches Gerados
+.fabric/
+downloads/
+logs/
+mods/
+resourcepacks/
+saves/
+options.txt
+crash-reports/
+
+# Utilitários Locais, Sockets, Imagens e Dumps
+tools/lib/
+scratch/
+*.log
+*.sock
+*.ppm
+*.qmp
+*.tmp
+tela.png*
+boot_log.txt
+/tmp/
+
+# Diários e Anotações de Aprendizado Locais (TIL)
+TIL*.md
+TIL-*.md
+
+# IDEs e Editores
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store

@@ -1,0 +1,131 @@
+#!/bin/sh
+# /etc/init.d/S99mineos - Inicializador do ambiente gráfico e da sessão MineOS
+set -e
+
+USER_NAME="mineos"
+USER_UID=1000
+RUNTIME_DIR="/run/user/$USER_UID"
+LOG_FILE="/var/log/mineos.log"
+VT="/dev/tty7"
+
+log() {
+    echo "[MineOS Init] $1" | tee -a "$LOG_FILE" > /dev/console 2>/dev/null || true
+}
+
+start() {
+    log "Iniciando a pilha operacional do MineOS..."
+
+    # 1. Garante montagens virtuais essenciais
+    mountpoint -q /proc 2>/dev/null || mount -t proc proc /proc 2>/dev/null || true
+    mountpoint -q /sys 2>/dev/null || mount -t sysfs sysfs /sys 2>/dev/null || true
+    mountpoint -q /dev/pts 2>/dev/null || mount -t devpts devpts /dev/pts 2>/dev/null || true
+    mountpoint -q /dev/shm 2>/dev/null || mount -t tmpfs tmpfs /dev/shm 2>/dev/null || true
+
+    # 2. Criação do utilizador e grupos
+    if ! id -u "$USER_NAME" >/dev/null 2>&1; then
+        log "Criando usuário do sistema '$USER_NAME'..."
+        adduser -D -u "$USER_UID" -s /bin/sh "$USER_NAME" || true
+        echo "$USER_NAME:mineos" | chpasswd 2>/dev/null || true
+    fi
+
+    for grp in video audio input tty seat; do
+        addgroup "$grp" 2>/dev/null || true
+        addgroup "$USER_NAME" "$grp" 2>/dev/null || true
+    done
+
+    # 3. Prepara XDG_RUNTIME_DIR
+    mkdir -p "$RUNTIME_DIR"
+    chown "$USER_NAME:$USER_NAME" "$RUNTIME_DIR"
+    chmod 0700 "$RUNTIME_DIR"
+
+    # 4. Ajusta permissões dos nós gráficos DRM/KMS, Framebuffer e TTY
+    log "Configurando permissões de hardware gráfico (DRM/KMS/TTY)..."
+    chmod 0755 /dev/dri 2>/dev/null || true
+    chown -R root:video /dev/dri 2>/dev/null || true
+    chmod 0666 /dev/dri/card* /dev/dri/renderD* 2>/dev/null || true
+    chmod 0666 /dev/fb* 2>/dev/null || true
+    chown "$USER_NAME:tty" "$VT" 2>/dev/null || true
+    chmod 0660 "$VT" 2>/dev/null || true
+    chmod 0666 /dev/tty0 2>/dev/null || true
+    chmod 0666 /dev/input/* 2>/dev/null || true
+    chmod 0666 /dev/input/event* 2>/dev/null || true
+    chmod 0755 /dev/snd 2>/dev/null || true
+    chmod 0666 /dev/snd/* 2>/dev/null || true
+
+    # 5. Inicia ou valida o gestor de sessões seatd
+    log "Verificando gestor de sessões seatd..."
+    if ! pidof seatd >/dev/null 2>&1 && command -v seatd >/dev/null 2>&1; then
+        log "Iniciando daemon seatd com grupo video..."
+        seatd -g video >/var/log/seatd.log 2>&1 &
+        sleep 1
+    fi
+    chmod 0666 /run/seatd.sock 2>/dev/null || true
+
+    # 6. Monta dados persistentes do Minecraft via 9P VirtFS se disponível
+    MC_HOME="/home/$USER_NAME/.minecraft"
+    mkdir -p "$MC_HOME"
+    chown -R "$USER_NAME:$USER_NAME" "/home/$USER_NAME"
+    log "Verificando montagem 9P 'mc_data' em $MC_HOME..."
+    if mount -t 9p -o trans=virtio,version=9p2000.L,access=client,rw mc_data "$MC_HOME" 2>/var/log/9p.log; then
+        log "[OK] Compartilhamento 9P 'mc_data' montado com sucesso em $MC_HOME."
+    elif mount -t 9p -o trans=virtio,version=9p2000.L mc_data "$MC_HOME" 2>/var/log/9p.log; then
+        log "[OK] Compartilhamento 9P 'mc_data' montado com sucesso (modo compatível) em $MC_HOME."
+    else
+        log "[AVISO] 9P 'mc_data' não montado: $(cat /var/log/9p.log 2>/dev/null || echo 'desconhecido')"
+    fi
+    chown -R "$USER_NAME:$USER_NAME" "$MC_HOME" 2>/dev/null || true
+
+    # 7. Inicia PipeWire se disponível
+    if command -v pipewire >/dev/null 2>&1; then
+        log "Inicializando servidor de áudio PipeWire..."
+        su - "$USER_NAME" -c "XDG_RUNTIME_DIR=$RUNTIME_DIR pipewire >/var/log/pipewire.log 2>&1 &" || true
+    fi
+
+    # 8. Inicializa o Cage Kiosk ancorado ao KMS/DRM com suporte a libinput
+    log "Lançando Cage Kiosk no modo KMS/DRM..."
+    if command -v cage >/dev/null 2>&1; then
+        su - "$USER_NAME" -c "
+            export XDG_RUNTIME_DIR=$RUNTIME_DIR
+            export WLR_LIBINPUT_NO_DEVICES=1
+            export WLR_DRM_DEVICES=/dev/dri/card0
+            export LIBSEAT_BACKEND=seatd
+            export WLR_LOG_LEVEL=info
+            export WLR_SCENE_DISABLE_DIRECT_SCANOUT=1
+            export WLR_DRM_NO_ATOMIC=1
+            export WLR_NO_HARDWARE_CURSORS=1
+            echo '[MineOS] Executando Cage Kiosk com start-minecraft.sh...'
+            exec cage -s -- /opt/mineos/start-minecraft.sh
+        " 2>&1 | tee -a "$LOG_FILE" > /dev/console &
+    else
+        log "[AVISO] Cage não encontrado. Executando start-minecraft.sh em modo direto."
+        su - "$USER_NAME" -c "
+            export XDG_RUNTIME_DIR=$RUNTIME_DIR
+            exec /opt/mineos/start-minecraft.sh
+        " 2>&1 | tee -a "$LOG_FILE" > /dev/console &
+    fi
+}
+
+stop() {
+    log "Parando o ambiente MineOS..."
+    killall cage 2>/dev/null || true
+    killall java 2>/dev/null || true
+    killall seatd 2>/dev/null || true
+}
+
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        stop
+        sleep 1
+        start
+        ;;
+    *)
+        echo "Uso: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac

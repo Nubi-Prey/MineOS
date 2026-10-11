@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "mineos-tools": {
+      "command": "python3",
+      "args": ["/home/nubi/Documents/MineOS/tools/mcp/mineos_mcp_server.py"],
+      "env": {
+        "MINEOS_ROOT": "/home/nubi/Documents/MineOS",
+        "PATH": "/home/nubi/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      }
+    }
+  }
+}
