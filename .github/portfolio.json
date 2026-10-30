@@ -1,0 +1,70 @@
+{
+  "schemaVersion": "2.0",
+  "id": "mineos",
+  "repo": "MineOS",
+  "casing": "Nubi-Prey/MineOS",
+  "categoryKey": "systems",
+  "badge": "BAREMETAL",
+  "refLabel": "BAREMETAL",
+  "title": "MineOS",
+  "description": "Distribuição Linux minimalista (JeOS) gerada com Buildroot 2025.02. Transforma o Minecraft 26.1.2 no compositor Wayland baremetal do sistema usando um módulo nativo em Rust (Smithay) integrado à JVM via Fabric e Java 25.",
+  "icon": "https://raw.githubusercontent.com/Nubi-Prey/MineOS/main/docs/icon.jpeg",
+  "visitLink": "https://github.com/Nubi-Prey/MineOS",
+  "tags": [
+    "Linux Kernel 6.6",
+    "Buildroot",
+    "Wayland (Smithay)",
+    "Rust",
+    "Java 25",
+    "QEMU / KVM"
+  ],
+  "links": {
+    "github": "https://github.com/Nubi-Prey/MineOS",
+    "releases": "https://github.com/Nubi-Prey/MineOS/releases",
+    "visit": null
+  },
+  "locales": {
+    "pt_BR": {
+      "title": "MineOS",
+      "tagline": "Minecraft como Compositor Wayland 3D Baremetal",
+      "category": "Sistemas & Kernel",
+      "badge": "BAREMETAL",
+      "refLabel": "BAREMETAL",
+      "description": "Distribuição Linux minimalista (JeOS) gerada com Buildroot 2025.02. Transforma o Minecraft 26.1.2 no compositor Wayland baremetal do sistema usando um módulo nativo em Rust (Smithay) integrado à JVM via Fabric e Java 25.",
+      "tags": [
+        "Linux Kernel 6.6",
+        "Buildroot",
+        "Wayland (Smithay)",
+        "Rust",
+        "Java 25",
+        "QEMU / KVM"
+      ],
+      "highlights": [
+        "Kernel Linux 6.6 LTS customizado com DRM/KMS, seatd e VirGL 3D (boot em ~3 segundos)",
+        "Motor nativo Waylandcraft em Rust (Smithay) acoplado à JVM Java 25 via Fabric",
+        "Persistência direta no host via 9P VirtFS e automação de testes com QEMU QMP"
+      ]
+    },
+    "en_US": {
+      "title": "MineOS",
+      "tagline": "Minecraft as a Baremetal 3D Wayland Compositor",
+      "category": "Systems & Kernel",
+      "badge": "BAREMETAL",
+      "refLabel": "BAREMETAL",
+      "description": "Custom minimalist Linux distribution (JeOS) built with Buildroot 2025.02. Transforms Minecraft 26.1.2 into the system's baremetal Wayland compositor using a native Rust (Smithay) module bridged to Java 25 via Fabric.",
+      "tags": [
+        "Linux Kernel 6.6",
+        "Buildroot",
+        "Wayland (Smithay)",
+        "Rust",
+        "Java 25",
+        "QEMU / KVM"
+      ],
+      "highlights": [
+        "Custom Linux Kernel 6.6 LTS with DRM/KMS, seatd, and VirGL 3D (boot in ~3 seconds)",
+        "Native Waylandcraft engine in Rust (Smithay) bridged to Java 25 JVM via Fabric",
+        "Direct host persistence via 9P VirtFS and automated testing via QEMU QMP"
+      ]
+    }
+  }
+}
